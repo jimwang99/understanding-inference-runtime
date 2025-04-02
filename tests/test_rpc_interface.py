@@ -58,6 +58,47 @@ class TestRPCInterface(unittest.TestCase):
         self.prod._join_threads()
         self.cons.join()
 
+    def test_blocking_read_write(self):
+        self.prod._start_threads()
+        self.cons.start()
+
+        data = b"hello"
+
+        addr = self.prod.alloc_remote(len(data), "cons")
+        self.prod.write_remote(addr, data, "cons")
+        data_rsp = self.prod.read_remote(addr, "cons")
+        self.assertEqual(data_rsp, data)
+
+        self.prod.exit_remote("test ends", "cons")
+        self.prod.quit()
+        self.prod._join_threads()
+        self.cons.join()
+
+    def test_non_blocking_read_write(self):
+        self.prod._start_threads()
+        self.cons.start()
+
+        data = b"hello"
+
+        f0 = self.prod.alloc_remote_nb(len(data), "cons")
+        f0.wait()
+        addr = f0.rsp_mesg.addr
+
+        f1 = self.prod.write_remote_nb(addr, data, "cons")
+        f2 = self.prod.read_remote_nb(addr, "cons")
+
+        f1.wait()
+        f2.wait()
+
+        self.assertEqual(f2.rsp_mesg.data, data)
+
+        f3 = self.prod.exit_remote_nb("test ends", "cons")
+        f3.wait()
+
+        self.prod.quit()
+        self.prod._join_threads()
+        self.cons.join()
+
 
 if __name__ == "__main__":
     unittest.main()

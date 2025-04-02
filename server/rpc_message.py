@@ -36,7 +36,6 @@ class FreeResponse(RPCMessage):
 @dataclass(kw_only=True)
 class ReadRequest(RPCMessage):
     addr: int
-    size: int
 
 
 @dataclass(kw_only=True)

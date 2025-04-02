@@ -309,6 +309,31 @@ class MockFirmware(MessageFutureHost):
         self.device.get_output_queue_by_alias(device_alias).put(mesg)
         return device, mesg
 
+    def _read_remote(
+        self, addr: int, device_alias: str
+    ) -> tuple[MockDevice, ReadRequest]:
+        device = self.device.get_device_by_alias(device_alias)
+        mesg = ReadRequest(
+            src_device_uid=self.device.uid,
+            dst_device_uid=device.uid,
+            addr=addr,
+        )
+        self.device.get_output_queue_by_alias(device_alias).put(mesg)
+        return device, mesg
+
+    def _write_remote(
+        self, addr: int, data: bytes, device_alias: str
+    ) -> tuple[MockDevice, WriteRequest]:
+        device = self.device.get_device_by_alias(device_alias)
+        mesg = WriteRequest(
+            src_device_uid=self.device.uid,
+            dst_device_uid=device.uid,
+            addr=addr,
+            data=data,
+        )
+        self.device.get_output_queue_by_alias(device_alias).put(mesg)
+        return device, mesg
+
     # --------------------------------------------------------------------------
     # blocking interface
     # --------------------------------------------------------------------------
@@ -319,7 +344,9 @@ class MockFirmware(MessageFutureHost):
         assert rsp.uid == req.uid
         assert isinstance(rsp, AllocResponse)
         if rsp.err != ErrCode.ESUCC:
-            raise RuntimeError(f"Failed to allocate memory on {device_alias}")
+            raise RuntimeError(
+                f"Failed to allocate memory on {device_alias}. {rsp.err=}"
+            )
         return rsp.addr
 
     def free_remote(self, addr: int, device_alias: str) -> None:
@@ -329,7 +356,7 @@ class MockFirmware(MessageFutureHost):
         assert rsp.uid == req.uid
         assert isinstance(rsp, FreeResponse)
         if rsp.err != ErrCode.ESUCC:
-            raise RuntimeError(f"Failed to free memory on {device_alias}")
+            raise RuntimeError(f"Failed to free memory on {device_alias}. {rsp.err=}")
 
     def exit_remote(self, reason: str, device_alias: str) -> None:
         _, req = self._exit_remote(reason, device_alias)
@@ -338,7 +365,26 @@ class MockFirmware(MessageFutureHost):
         assert rsp.uid == req.uid
         assert isinstance(rsp, ExitResponse)
         if rsp.err != ErrCode.ESUCC:
-            raise RuntimeError(f"Failed to exit on {device_alias}")
+            raise RuntimeError(f"Failed to exit on {device_alias}. {rsp.err=}")
+
+    def read_remote(self, addr: int, device_alias: str) -> bytes:
+        _, req = self._read_remote(addr, device_alias)
+
+        rsp = self.device.input_queue.get()
+        assert rsp.uid == req.uid
+        assert isinstance(rsp, ReadResponse)
+        if rsp.err != ErrCode.ESUCC:
+            raise RuntimeError(f"Failed to read from {device_alias}. {rsp.err=}")
+        return rsp.data
+
+    def write_remote(self, addr: int, data: bytes, device_alias: str) -> None:
+        _, req = self._write_remote(addr, data, device_alias)
+
+        rsp = self.device.input_queue.get()
+        assert rsp.uid == req.uid
+        assert isinstance(rsp, WriteResponse)
+        if rsp.err != ErrCode.ESUCC:
+            raise RuntimeError(f"Failed to write to {device_alias}. {rsp.err=}")
 
     # --------------------------------------------------------------------------
     # non-blocking interface
@@ -356,37 +402,15 @@ class MockFirmware(MessageFutureHost):
         _, req = self._exit_remote(reason, device_alias)
         return self.create_mesg_future(req)
 
-    # def read_remote_nb(self, addr: int, size: int, device_alias: str) -> None:
-    #     device = self.device.get_device_by_alias(device_alias)
-    #     mesg = ReadRequest(
-    #         src_device_uid=self.device.uid,
-    #         dst_device_uid=device.uid,
-    #         addr=addr,
-    #         size=size,
-    #     )
-    #     self.device.get_output_queue_by_alias(device_alias).put(mesg)
+    def read_remote_nb(self, addr: int, device_alias: str) -> MessageFuture:
+        _, req = self._read_remote(addr, device_alias)
+        return self.create_mesg_future(req)
 
-    # def write_remote_nb(self, addr: int, data: bytes, device_alias: str) -> None:
-    #     device = self.device.get_device_by_alias(device_alias)
-    #     mesg = WriteRequest(
-    #         src_device_uid=self.device.uid,
-    #         dst_device_uid=device.uid,
-    #         addr=addr,
-    #         data=data,
-    #     )
-    #     self.device.get_output_queue_by_alias(device_alias).put(mesg)
-
-    # def execute_remote_nb(
-    #     self, executable_addr: int, args_addr: int, device_alias: str
-    # ) -> None:
-    #     device = self.device.get_device_by_alias(device_alias)
-    #     mesg = ExecuteRequest(
-    #         src_device_uid=self.device.uid,
-    #         dst_device_uid=device.uid,
-    #         executable_addr=executable_addr,
-    #         args_addr=args_addr,
-    #     )
-    #     self.device.get_output_queue_by_alias(device_alias).put(mesg)
+    def write_remote_nb(
+        self, addr: int, data: bytes, device_alias: str
+    ) -> MessageFuture:
+        _, req = self._write_remote(addr, data, device_alias)
+        return self.create_mesg_future(req)
 
     # ==========================================================================
     # create / delete a new object on connected devices
