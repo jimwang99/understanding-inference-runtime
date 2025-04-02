@@ -1,0 +1,63 @@
+import unittest
+
+from loguru import logger
+
+from server.mock_hardware import MockDevice
+from server.mock_firmware import MockFirmware
+
+
+class TestRPCInterface(unittest.TestCase):
+    def setUp(self):
+        self.device_prod = MockDevice(uid="prod", dtype="PRODUCER", max_mem_size="1TB")
+        self.device_cons = MockDevice(uid="cons", dtype="CONSUMER", max_mem_size="1TB")
+        self.device_prod.connect(self.device_cons, "cons")
+        self.device_cons.connect(self.device_prod, "prod")
+
+        self.prod = MockFirmware(self.device_prod)
+        self.cons = MockFirmware(self.device_cons)
+
+    def test_blocking_alloc_free(self):
+        self.prod._start_threads()
+        self.cons.start()
+
+        addr = self.prod.alloc_remote(8, "cons")
+        self.prod.free_remote(addr, "cons")
+
+        self.prod.exit_remote("test ends", "cons")
+        self.prod.quit()
+        self.prod._join_threads()
+        self.cons.join()
+
+    def test_non_blocking_alloc_free(self):
+        self.prod._start_threads()
+        self.cons.start()
+
+        f0 = self.prod.alloc_remote_nb(8, "cons")
+        f1 = self.prod.alloc_remote_nb(16, "cons")
+        f2 = self.prod.alloc_remote_nb(32, "cons")
+        f3 = self.prod.alloc_remote_nb(64, "cons")
+
+        f0.wait()
+        f4 = self.prod.free_remote_nb(f0.rsp_mesg.addr, "cons")
+        f1.wait()
+        f5 = self.prod.free_remote_nb(f1.rsp_mesg.addr, "cons")
+        f2.wait()
+        f6 = self.prod.free_remote_nb(f2.rsp_mesg.addr, "cons")
+        f3.wait()
+        f7 = self.prod.free_remote_nb(f3.rsp_mesg.addr, "cons")
+
+        f4.wait()
+        f5.wait()
+        f6.wait()
+        f7.wait()
+
+        f8 = self.prod.exit_remote_nb("test ends", "cons")
+        f8.wait()
+
+        self.prod.quit()
+        self.prod._join_threads()
+        self.cons.join()
+
+
+if __name__ == "__main__":
+    unittest.main()
