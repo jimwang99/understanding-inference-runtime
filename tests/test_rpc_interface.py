@@ -20,10 +20,11 @@ class TestRPCInterface(unittest.TestCase):
         self.prod._start_threads()
         self.cons.start()
 
-        addr = self.prod.alloc_remote(8, "cons")
-        self.prod.free_remote(addr, "cons")
+        addr = self.prod.alloc_remote_b(8, "cons")
+        self.prod.free_remote_b(addr, "cons")
 
-        self.prod.exit_remote("test ends", "cons")
+        self.prod.exit_remote_b("test ends", "cons")
+
         self.prod.quit()
         self.prod._join_threads()
         self.cons.join()
@@ -64,18 +65,20 @@ class TestRPCInterface(unittest.TestCase):
 
         data = b"hello"
 
-        addr = self.prod.alloc_remote(len(data), "cons")
-        self.prod.write_remote(addr, data, "cons")
-        data_rsp = self.prod.read_remote(addr, "cons")
+        addr = self.prod.alloc_remote_b(len(data), "cons")
+        self.prod.write_remote_b(addr, data, "cons")
+        data_rsp = self.prod.read_remote_b(addr, "cons")
         self.assertEqual(data_rsp, data)
 
-        self.prod.exit_remote("test ends", "cons")
+        self.prod.exit_remote_b("test ends", "cons")
         self.prod.quit()
         self.prod._join_threads()
         self.cons.join()
 
     def test_non_blocking_read_write(self):
-        self.prod._start_threads()
+        self.prod._start_threads()  # we only starts the threads of the prod,
+        # instead of the process, so that we can continue to use self.prod.xxx
+        # methods directly in the test code
         self.cons.start()
 
         data = b"hello"

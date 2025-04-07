@@ -9,7 +9,6 @@ import time
 
 from abc import ABC, abstractmethod
 from loguru import logger
-from typing import Any
 
 from .error_code import ErrCode
 from .mock_hardware import MockDevice
@@ -70,34 +69,20 @@ class Event:
         self.value = False
         self.lock.release()
 
-    def wait(self, timeout: float = 1.0) -> None:
+    def wait(self, timeout: float = 1.0, clear: bool = False) -> ErrCode:
         start_time = time.time()
         while True:
             self.lock.acquire()
             if self.value:
+                if clear:
+                    self.value = False
                 self.lock.release()
                 break
             self.lock.release()
             time.sleep(WAIT_TIME)
             if time.time() - start_time > timeout:
-                raise TimeoutError(
-                    f"Event {self.name} timed out after {timeout} seconds"
-                )
-
-    def wait_and_clear(self, timeout: float = 1.0) -> None:
-        start_time = time.time()
-        while True:
-            self.lock.acquire()
-            if self.value:
-                self.value = False
-                self.lock.release()
-                break
-            self.lock.release()
-            time.sleep(WAIT_TIME)
-            if time.time() - start_time > timeout:
-                raise TimeoutError(
-                    f"Event {self.name} timed out after {timeout} seconds"
-                )
+                return ErrCode.ETIME
+        return ErrCode.ESUCC
 
 
 class Pointers:
@@ -120,6 +105,8 @@ class Executable(ABC):
 
     def __init__(self, name: str):
         self.name = name
+        self.firmware: MockFirmware | None = None
+        self.args: Pointers | None = None
 
     def __repr__(self) -> str:
         s = f"<Executable: {self.name}>"
@@ -128,9 +115,64 @@ class Executable(ABC):
     def size(self) -> int:
         return len(pickle.dumps(self))
 
+    def __call__(self, firmware: MockFirmware, args: Pointers) -> ErrCode:
+        self.firmware = firmware
+        self.args = args
+        return self._execute()
+
     @abstractmethod
-    def __call__(self, args: Pointers, host: MockDevice) -> ErrCode:
-        raise NotImplementedError
+    def _execute(self) -> ErrCode:
+        return ErrCode.ENOENT
+
+    # ==========================================================================
+    # Kernel interface
+    # ==========================================================================
+
+    def quit(self) -> None:
+        assert self.firmware is not None
+        self.firmware.quit()
+
+    # --------------------------------------------------------------------------
+    # create / delete a new object locally
+    # --------------------------------------------------------------------------
+    def create_any(self, data: Tensor | Event | Pointers | Executable, device_uid: str = "", blocking: bool = False) -> int:
+        assert self.firmware is not None
+        if device_uid:
+            # remote allocation
+            if blocking:
+                addr, err = self.firmware.alloc_remote_b(data.size(), device_uid)
+            else:
+                addr, err = self.firmware.alloc_remote_nb(data.size(), device_uid)
+        else:
+            # local allocation
+            addr, err = self.firmware.alloc_local(data.size())
+            if err != ErrCode.ESUCC:
+                raise RuntimeError(
+                    f"Failed to allocate memory for {data.mtype} {data.name}"
+                )
+            self.firmware.write_local(addr, pickle.dumps(data))
+        return addr
+
+    def delete_any(self, addr: int) -> None:
+        assert self.firmware is not None
+        err = self.firmware.free_local(addr)
+        if err != ErrCode.ESUCC:
+            raise RuntimeError(f"Failed to free memory at {addr}")
+
+    def create_tensor(self, name: str, shape: tuple[int, ...]) -> int:
+        data = Tensor(name, np.empty(shape, dtype=np.float32))
+        return self.create_any(data)
+
+    def create_event(self, name: str) -> int:
+        data = Event(name)
+        return self.create_any(data)
+
+    def create_pointers(self, name: str, ptrs: list[str]) -> int:
+        data = Pointers(name, ptrs)
+        return self.create_any(data)
+
+    def create_executable(self, name: str, executable: Executable) -> int:
+        return self.create_any(executable)
 
 
 class MessageFuture:
@@ -199,24 +241,37 @@ class MessageFutureHost:
             )
 
 
+EMPTY_POINTERS = Pointers("empty", [])
+
+
 class MockFirmware(MessageFutureHost):
     def __init__(self, device: MockDevice) -> None:
         super().__init__()
         self.device = device
+
+        self.alloc_local = self.device.alloc
+        self.free_local = self.device.free
+        self.read_local = self.device.read
+        self.write_local = self.device.write
+        self.get_remote_device = self.device.get_device_by_alias
+        self.get_output_queue = self.device.get_output_queue_by_alias
+        self.input_queue = self.device.input_queue
+        self.execution_queue = self.device.execution_queue
+
         self.proc: mp.Process | None = None
         self.threads: dict[str, threading.Thread] = {}
 
         self.quit_event = mp.Event()
 
+        self.exceptions: mp.Queue[Exception] = mp.Queue()
+
     def start(self) -> None:
-        logger.info(f"{self.device.uid}: Starting process")
-        logger.info(f"{self.device.uid}: {self=}")
+        logger.info(f"{self.device.uid}: Starting process {self=}")
         self.proc = mp.Process(target=self._start_threads)
         self.proc.start()
 
     def _start_threads(self) -> None:
-        logger.info(f"{self.device.uid}: Starting threads")
-        logger.info(f"{self.device.uid}: {self=}")
+        logger.info(f"{self.device.uid}: Starting threads {self=}")
         self.threads["input_handler"] = threading.Thread(target=self.input_handler)
         self.threads["execution_handler"] = threading.Thread(
             target=self.execution_handler
@@ -226,7 +281,7 @@ class MockFirmware(MessageFutureHost):
             thread.start()
 
     def quit(self) -> None:
-        logger.info(f"{self.device.uid}: Setting quit event")
+        logger.debug(f"{self.device.uid}: Setting quit event")
         self.quit_event.set()
 
     def _join_threads(self) -> None:
@@ -240,226 +295,197 @@ class MockFirmware(MessageFutureHost):
             logger.info(f"{self.device.uid}: Joining process")
             self.proc.join()
 
-    # ==========================================================================
-    # create / delete a new object locally
-    # ==========================================================================
-    def create_any(self, data: Tensor | Event | Pointers | Executable) -> int:
-        addr, err = self.device.alloc(data.size())
-        if err != ErrCode.ESUCC:
-            raise RuntimeError(
-                f"Failed to allocate memory for {data.mtype} {data.name}"
-            )
-        self.device.write(addr, pickle.dumps(data))
-        return addr
+            if not self.exceptions.empty():
+                while not self.exceptions.empty():
+                    e = self.exceptions.get()
+                    logger.error(f"{self.device.uid}: Exception in process: {e}")
+                raise RuntimeError(f"{self.device.uid}: Exception in process")
 
-    def create_tensor(self, name: str, shape: tuple[int, ...]) -> int:
-        data = Tensor(name, np.empty(shape, dtype=np.float32))
-        return self.create_any(data)
+            logger.info(f"{self.device.uid}: Process joined")
 
-    def create_event(self, name: str) -> int:
-        data = Event(name)
-        return self.create_any(data)
+    def _raise(self, e: Exception) -> None:
+        self.exceptions.put(e)
+        raise e
 
-    def create_pointers(self, name: str, ptrs: list[str]) -> int:
-        data = Pointers(name, ptrs)
-        return self.create_any(data)
-
-    def delete_any(self, addr: int) -> None:
-        err = self.device.free(addr)
-        if err != ErrCode.ESUCC:
-            raise RuntimeError(f"Failed to free memory at {addr}")
+    def _assert(self, cond: bool, msg: str) -> None:
+        if not cond:
+            self._raise(AssertionError(msg))
+        assert cond, msg
 
     # ==========================================================================
     # RPC interface to a connected device
     # ==========================================================================
 
-    def _alloc_remote(
-        self, size: int, device_alias: str
-    ) -> tuple[MockDevice, AllocRequest]:
-        device = self.device.get_device_by_alias(device_alias)
+    def _alloc_remote(self, size: int, remote_device_alias: str) -> AllocRequest:
+        remote_device = self.get_remote_device(remote_device_alias)
         mesg = AllocRequest(
             src_device_uid=self.device.uid,
-            dst_device_uid=device.uid,
+            dst_device_uid=remote_device.uid,
             size=size,
         )
-        self.device.get_output_queue_by_alias(device_alias).put(mesg)
-        return device, mesg
+        self.get_output_queue(remote_device_alias).put(mesg)
+        return mesg
 
-    def _free_remote(
-        self, addr: int, device_alias: str
-    ) -> tuple[MockDevice, FreeRequest]:
-        device = self.device.get_device_by_alias(device_alias)
+    def _free_remote(self, addr: int, remote_device_alias: str) -> FreeRequest:
+        remote_device = self.get_remote_device(remote_device_alias)
         mesg = FreeRequest(
             src_device_uid=self.device.uid,
-            dst_device_uid=device.uid,
+            dst_device_uid=remote_device.uid,
             addr=addr,
         )
-        self.device.get_output_queue_by_alias(device_alias).put(mesg)
-        return device, mesg
+        self.get_output_queue(remote_device_alias).put(mesg)
+        return mesg
 
-    def _exit_remote(
-        self, reason: str, device_alias: str
-    ) -> tuple[MockDevice, ExitRequest]:
-        device = self.device.get_device_by_alias(device_alias)
+    def _exit_remote(self, reason: str, remote_device_alias: str) -> ExitRequest:
+        remote_device = self.get_remote_device(remote_device_alias)
         mesg = ExitRequest(
             src_device_uid=self.device.uid,
-            dst_device_uid=device.uid,
+            dst_device_uid=remote_device.uid,
             reason=reason,
         )
-        self.device.get_output_queue_by_alias(device_alias).put(mesg)
-        return device, mesg
+        self.get_output_queue(remote_device_alias).put(mesg)
+        return mesg
 
-    def _read_remote(
-        self, addr: int, device_alias: str
-    ) -> tuple[MockDevice, ReadRequest]:
-        device = self.device.get_device_by_alias(device_alias)
+    def _read_remote(self, addr: int, remote_device_alias: str) -> ReadRequest:
+        remote_device = self.get_remote_device(remote_device_alias)
         mesg = ReadRequest(
             src_device_uid=self.device.uid,
-            dst_device_uid=device.uid,
+            dst_device_uid=remote_device.uid,
             addr=addr,
         )
-        self.device.get_output_queue_by_alias(device_alias).put(mesg)
-        return device, mesg
+        self.get_output_queue(remote_device_alias).put(mesg)
+        return mesg
 
     def _write_remote(
-        self, addr: int, data: bytes, device_alias: str
-    ) -> tuple[MockDevice, WriteRequest]:
-        device = self.device.get_device_by_alias(device_alias)
+        self, addr: int, data: bytes, remote_device_alias: str
+    ) -> WriteRequest:
+        remote_device = self.get_remote_device(remote_device_alias)
         mesg = WriteRequest(
             src_device_uid=self.device.uid,
-            dst_device_uid=device.uid,
+            dst_device_uid=remote_device.uid,
             addr=addr,
             data=data,
         )
-        self.device.get_output_queue_by_alias(device_alias).put(mesg)
-        return device, mesg
+        self.get_output_queue(remote_device_alias).put(mesg)
+        return mesg
 
     # --------------------------------------------------------------------------
     # blocking interface
     # --------------------------------------------------------------------------
-    def alloc_remote(self, size: int, device_alias: str) -> int:
-        _, req = self._alloc_remote(size, device_alias)
+    def alloc_remote_b(self, size: int, remote_device_alias: str) -> int:
+        req = self._alloc_remote(size, remote_device_alias)
 
-        rsp = self.device.input_queue.get()
-        assert rsp.uid == req.uid
-        assert isinstance(rsp, AllocResponse)
+        rsp = self.input_queue.get()
+        self._assert(rsp.uid == req.uid, f"{rsp.uid=} != {req.uid=}")
+        self._assert(isinstance(rsp, AllocResponse), f"{type(rsp)=} is not AllocResponse")
+        assert isinstance(rsp, AllocResponse) # to satisfy type checker
         if rsp.err != ErrCode.ESUCC:
-            raise RuntimeError(
-                f"Failed to allocate memory on {device_alias}. {rsp.err=}"
+            self._raise(
+                RuntimeError(
+                    f"Failed to allocate memory on {remote_device_alias}. {rsp.err=}"
+                )
             )
         return rsp.addr
 
-    def free_remote(self, addr: int, device_alias: str) -> None:
-        _, req = self._free_remote(addr, device_alias)
+    def free_remote_b(self, addr: int, remote_device_alias: str) -> None:
+        req = self._free_remote(addr, remote_device_alias)
 
-        rsp = self.device.input_queue.get()
-        assert rsp.uid == req.uid
-        assert isinstance(rsp, FreeResponse)
+        rsp = self.input_queue.get()
+        self._assert(rsp.uid == req.uid, f"{rsp.uid=} != {req.uid=}")
+        self._assert(isinstance(rsp, FreeResponse), f"{type(rsp)=} is not FreeResponse")
+        assert isinstance(rsp, FreeResponse) # to satisfy type checker
         if rsp.err != ErrCode.ESUCC:
-            raise RuntimeError(f"Failed to free memory on {device_alias}. {rsp.err=}")
+            self._raise(
+                RuntimeError(
+                    f"Failed to free memory on {remote_device_alias}. {rsp.err=}"
+                )
+            )
 
-    def exit_remote(self, reason: str, device_alias: str) -> None:
-        _, req = self._exit_remote(reason, device_alias)
+    def exit_remote_b(self, reason: str, remote_device_alias: str) -> None:
+        req = self._exit_remote(reason, remote_device_alias)
 
-        rsp = self.device.input_queue.get()
-        assert rsp.uid == req.uid
-        assert isinstance(rsp, ExitResponse)
+        rsp = self.input_queue.get()
+        self._assert(rsp.uid == req.uid, f"{rsp.uid=} != {req.uid=}")
+        self._assert(isinstance(rsp, ExitResponse), f"{type(rsp)=} is not ExitResponse")
+        assert isinstance(rsp, ExitResponse) # to satisfy type checker
         if rsp.err != ErrCode.ESUCC:
-            raise RuntimeError(f"Failed to exit on {device_alias}. {rsp.err=}")
+            self._raise(
+                RuntimeError(f"Failed to exit on {remote_device_alias}. {rsp.err=}")
+            )
 
-    def read_remote(self, addr: int, device_alias: str) -> bytes:
-        _, req = self._read_remote(addr, device_alias)
+    def read_remote_b(self, addr: int, remote_device_alias: str) -> bytes:
+        req = self._read_remote(addr, remote_device_alias)
 
-        rsp = self.device.input_queue.get()
-        assert rsp.uid == req.uid
-        assert isinstance(rsp, ReadResponse)
+        rsp = self.input_queue.get()
+        self._assert(rsp.uid == req.uid, f"{rsp.uid=} != {req.uid=}")
+        self._assert(isinstance(rsp, ReadResponse), f"{type(rsp)=} is not ReadResponse")
+        assert isinstance(rsp, ReadResponse) # to satisfy type checker
         if rsp.err != ErrCode.ESUCC:
-            raise RuntimeError(f"Failed to read from {device_alias}. {rsp.err=}")
+            self._raise(
+                RuntimeError(f"Failed to read from {remote_device_alias}. {rsp.err=}")
+            )
         return rsp.data
 
-    def write_remote(self, addr: int, data: bytes, device_alias: str) -> None:
-        _, req = self._write_remote(addr, data, device_alias)
+    def write_remote_b(self, addr: int, data: bytes, remote_device_alias: str) -> None:
+        req = self._write_remote(addr, data, remote_device_alias)
 
-        rsp = self.device.input_queue.get()
-        assert rsp.uid == req.uid
-        assert isinstance(rsp, WriteResponse)
+        rsp = self.input_queue.get()
+        self._assert(rsp.uid == req.uid, f"{rsp.uid=} != {req.uid=}")
+        self._assert(isinstance(rsp, WriteResponse), f"{type(rsp)=} is not WriteResponse")
+        assert isinstance(rsp, WriteResponse) # to satisfy type checker
         if rsp.err != ErrCode.ESUCC:
-            raise RuntimeError(f"Failed to write to {device_alias}. {rsp.err=}")
+            self._raise(
+                RuntimeError(f"Failed to write to {remote_device_alias}. {rsp.err=}")
+            )
 
     # --------------------------------------------------------------------------
     # non-blocking interface
     # --------------------------------------------------------------------------
 
-    def alloc_remote_nb(self, size: int, device_alias: str) -> MessageFuture:
-        _, req = self._alloc_remote(size, device_alias)
+    def alloc_remote_nb(self, size: int, remote_device_alias: str) -> MessageFuture:
+        req = self._alloc_remote(size, remote_device_alias)
         return self.create_mesg_future(req)
 
-    def free_remote_nb(self, addr: int, device_alias: str) -> MessageFuture:
-        _, req = self._free_remote(addr, device_alias)
+    def free_remote_nb(self, addr: int, remote_device_alias: str) -> MessageFuture:
+        req = self._free_remote(addr, remote_device_alias)
         return self.create_mesg_future(req)
 
-    def exit_remote_nb(self, reason: str, device_alias: str) -> MessageFuture:
-        _, req = self._exit_remote(reason, device_alias)
+    def exit_remote_nb(self, reason: str, remote_device_alias: str) -> MessageFuture:
+        req = self._exit_remote(reason, remote_device_alias)
         return self.create_mesg_future(req)
 
-    def read_remote_nb(self, addr: int, device_alias: str) -> MessageFuture:
-        _, req = self._read_remote(addr, device_alias)
+    def read_remote_nb(self, addr: int, remote_device_alias: str) -> MessageFuture:
+        req = self._read_remote(addr, remote_device_alias)
         return self.create_mesg_future(req)
 
     def write_remote_nb(
-        self, addr: int, data: bytes, device_alias: str
+        self, addr: int, data: bytes, remote_device_alias: str
     ) -> MessageFuture:
-        _, req = self._write_remote(addr, data, device_alias)
+        req = self._write_remote(addr, data, remote_device_alias)
         return self.create_mesg_future(req)
-
-    # ==========================================================================
-    # create / delete a new object on connected devices
-    # ==========================================================================
-    # def create_remote_any(
-    #     self,
-    #     data: Tensor | Event | Pointers | Executable,
-    #     device_alias: str,
-    # ) -> int:
-    #     self.alloc_remote_nb(data.size(), device_alias)
-
-    # def create_remote_tensor(
-    #     self, name: str, shape: tuple[int, ...], device_alias: str
-    # ) -> int:
-    #     data = Tensor(name, np.empty(shape, dtype=np.float32))
-    #     return self.create_remote_any(data, device_alias)
-
-    # def create_remote_event(self, name: str, device_alias: str) -> int:
-    #     data = Event(name)
-    #     return self.create_remote_any(data, device_alias)
-
-    # def create_pointers_on_device(
-    #     self, name: str, ptrs: list[str], device_alias: str
-    # ) -> int:
-    #     data = Pointers(name, ptrs)
-    #     return self.create_any_on_device(data, device_alias)
-
-    # def delete_any_on_device(self, addr: int, device_alias: str) -> None:
-    #     device = self.device.get_device_by_alias(device_alias)
-    #     err = device.free(addr)
-    #     if err != ErrCode.ESUCC:
-    #         raise RuntimeError(f"Failed to free memory at {addr}")
 
     # ==========================================================================
     # input message handler
     # ==========================================================================
     def input_handler(self, is_test: bool = False) -> None:
-        logger.info(f"{self.device.uid}: {self=}")
+        logger.info(f"{self.device.uid}: Running input handler of {self=}")
         while not self.quit_event.is_set() and not is_test:
+            # get a message from the input queue
+            # use non-blocking get so that we can check `self.quit_event`
             try:
-                mesg = self.device.input_queue.get_nowait()
+                mesg = self.input_queue.get_nowait()
             except queue.Empty:
                 time.sleep(WAIT_TIME)
                 continue
+
             logger.trace(f"{self.device.uid}: {mesg=}")
             assert mesg.dst_device_uid == self.device.uid, (
                 f"{mesg.dst_device_uid=} != {self.device.uid=}"
             )
-            # process the message
+
+            # ------------------------------------------------------------------
+            # process the request messages
+            # ------------------------------------------------------------------
             if isinstance(mesg, AllocRequest):
                 addr, err = self.device.alloc(mesg.size)
                 self.device.output_queues[mesg.src_device_uid].put(
@@ -504,7 +530,9 @@ class MockFirmware(MessageFutureHost):
                 )
             elif isinstance(mesg, ExecuteRequest):
                 # defer to execution queue
-                self.device.execution_queue.put(mesg)
+                # because execution usually runs for a while
+                # and we don't want to block the input handler thread
+                self.execution_queue.put(mesg)
             elif isinstance(mesg, ExitRequest):
                 logger.info(f'{self.device.uid}: Exiting because of "{mesg.reason}"')
                 self.device.output_queues[mesg.src_device_uid].put(
@@ -516,6 +544,9 @@ class MockFirmware(MessageFutureHost):
                     )
                 )
                 self.quit()
+            # ------------------------------------------------------------------
+            # process the response messages
+            # ------------------------------------------------------------------
             elif isinstance(mesg, AllocResponse):
                 self.set_mesg_future(mesg)
             elif isinstance(mesg, FreeResponse):
@@ -529,19 +560,122 @@ class MockFirmware(MessageFutureHost):
             elif isinstance(mesg, ExitResponse):
                 self.set_mesg_future(mesg)
             else:
-                raise ValueError(f"Invalid message type: {type(mesg)=}")
+                self._raise(ValueError(f"Invalid message type: {type(mesg)=}"))
+
+    # ==========================================================================
+    # execution message handler
+    # ==========================================================================
+    # we choose to handel execution messages in a separate thread because
+    # there will be "waiting for events" operations in the executable, and we
+    # don't want to block the input handler thread
 
     def execution_handler(self, is_test: bool = False) -> None:
-        logger.info(f"{self.device.uid}: {self=}")
+        logger.info(f"{self.device.uid}: Running execution handler of {self=}")
         while not self.quit_event.is_set() and not is_test:
+            # get a message from the execution queue
+            # use non-blocking get so that we can check `self.quit_event`
             try:
-                mesg = self.device.execution_queue.get_nowait()
+                mesg = self.execution_queue.get_nowait()
             except queue.Empty:
                 time.sleep(WAIT_TIME)
                 continue
+
+            is_local = mesg.src_device_uid == self.device.uid
+            logger.trace(f"{self.device.uid}: {mesg=} is_local={is_local}")
             assert mesg.dst_device_uid == self.device.uid
-            # process the message
-            if isinstance(mesg, ExecuteRequest):
-                pass
-            else:
-                raise ValueError(f"Invalid message type: {type(mesg)=}")
+            assert isinstance(mesg, ExecuteRequest), f"{type(mesg)=}"
+
+            # ------------------------------------------------------------------
+            # process the execution request
+            # ------------------------------------------------------------------
+            # read executable from local memory
+            raw, err = self.device.read(mesg.executable_addr)
+            if err != ErrCode.ESUCC:
+                if is_local:
+                    self._raise(
+                        RuntimeError(
+                            f"Failed to read executable from local memory. {err=}"
+                        )
+                    )
+                else:
+                    self.device.output_queues[mesg.src_device_uid].put(
+                        ExecuteResponse(
+                            uid=mesg.uid,
+                            src_device_uid=mesg.dst_device_uid,
+                            dst_device_uid=mesg.src_device_uid,
+                            err=err,
+                        )
+                    )
+                continue
+
+            # convert memory raw bytes to Executable object
+            executable = pickle.loads(raw)
+            assert isinstance(executable, Executable), f"{type(executable)=}"
+
+            # read args from local memory
+            raw, err = self.device.read(mesg.args_addr)
+            if err != ErrCode.ESUCC:
+                if is_local:
+                    self._raise(
+                        RuntimeError(f"Failed to read args from local memory. {err=}")
+                    )
+                else:
+                    self.device.output_queues[mesg.src_device_uid].put(
+                        ExecuteResponse(
+                            uid=mesg.uid,
+                            src_device_uid=mesg.dst_device_uid,
+                            dst_device_uid=mesg.src_device_uid,
+                            err=err,
+                        )
+                    )
+                continue
+
+            # convert memory raw bytes to Pointers object
+            args = pickle.loads(raw)
+            assert isinstance(args, Pointers), f"{type(args)=}"
+
+            # execute the executable
+            logger.debug(f"{self.device.uid}: Executing {executable} with {args}")
+            err = executable(self, args)
+
+            # check result
+            if err != ErrCode.ESUCC:
+                if is_local:
+                    self._raise(
+                        RuntimeError(f"Failed to execute executable. {err=}")
+                    )
+                else:
+                    # send response to the source device
+                    self.device.output_queues[mesg.src_device_uid].put(
+                        ExecuteResponse(
+                            uid=mesg.uid,
+                            src_device_uid=mesg.dst_device_uid,
+                            dst_device_uid=mesg.src_device_uid,
+                            err=err,
+                        )
+                    )
+            logger.debug(f"{self.device.uid}: Executed {executable} with {args}")
+
+    def load_boot_program(
+        self, executable: Executable, args: Pointers = EMPTY_POINTERS
+    ) -> None:
+        logger.debug(f"{self.device.uid}: Loading boot program {executable} with {args}")
+
+        executable_addr, err = self.alloc_local(executable.size())
+        assert err == ErrCode.ESUCC
+
+        args_addr, err = self.alloc_local(args.size())
+        assert err == ErrCode.ESUCC
+
+        self.write_local(executable_addr, pickle.dumps(executable))
+        self.write_local(args_addr, pickle.dumps(args))
+
+        self.execution_queue.put(
+            ExecuteRequest(
+                src_device_uid=self.device.uid,
+                dst_device_uid=self.device.uid,
+                uid=-1,
+                executable_addr=executable_addr,
+                args_addr=args_addr,
+            )
+        )
