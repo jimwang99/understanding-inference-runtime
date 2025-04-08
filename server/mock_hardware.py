@@ -1,11 +1,13 @@
 from __future__ import annotations
-import multiprocessing as mp
+
+import queue
+from typing import Any
 
 from dataclasses import dataclass
 from loguru import logger
 
 from .error_code import ErrCode
-from .rpc_message import RPCMessage
+from .fw.rpc_message import RPCMessage
 
 KB = 1024
 MB = 1024 * 1024
@@ -17,10 +19,10 @@ TB = 1024 * 1024 * 1024 * 1024
 class MemBlock:
     addr: int
     size: int
-    raw: bytes = b""
+    value: Any = None
 
     def __repr__(self) -> str:
-        return f"<Memory: {self.addr:08x} {self.size / MB:.2f}MB>"
+        return f"<Memory: {self.addr:08x} {self.size / MB:.2f}MB {type(self.value)}>"
 
 
 class MockDevice:
@@ -55,9 +57,9 @@ class MockDevice:
         self.connected_devices: dict[str, MockDevice] = {}
         self.device_alias_to_uid: dict[str, str] = {}
 
-        self.input_queue: mp.Queue[RPCMessage] = mp.Queue()
-        self.output_queues: dict[str, mp.Queue[RPCMessage]] = {}
-        self.execution_queue: mp.Queue[RPCMessage] = mp.Queue()
+        self.input_queue: queue.Queue[RPCMessage] = queue.Queue()
+        self.output_queues: dict[str, queue.Queue[RPCMessage]] = {}
+        self.execution_queue: queue.Queue[RPCMessage] = queue.Queue()
 
     def __str__(self) -> str:
         return self.uid
@@ -79,11 +81,11 @@ class MockDevice:
     def get_device_by_alias(self, alias: str) -> MockDevice:
         return self.connected_devices[self.device_alias_to_uid[alias]]
 
-    def get_output_queue_by_alias(self, alias: str) -> mp.Queue[RPCMessage]:
+    def get_output_queue_by_alias(self, alias: str) -> queue.Queue[RPCMessage]:
         return self.output_queues[self.device_alias_to_uid[alias]]
 
     def alloc(self, size: int) -> tuple[int, ErrCode]:
-        logger.debug(f"{self.uid}: Allocating memory of {size=} bytes")
+        logger.trace(f"{self.uid}: Allocating memory of {size=} bytes")
         if size > self.remaining_mem_size:
             logger.error(
                 f"{self.uid}: Not enough memory {size=}>{self.remaining_mem_size=}"
@@ -101,12 +103,12 @@ class MockDevice:
         return mb.addr, ErrCode.ESUCC
 
     def free(self, addr: int) -> ErrCode:
-        logger.debug(f"{self.uid}: Freeing memory {addr=}")
+        logger.trace(f"{self.uid}: Freeing memory {addr=}")
         try:
             mb = self.mem_blocks[addr]
             self.remaining_mem_size += mb.size
             del self.mem_blocks[mb.addr]
-            logger.debug(
+            logger.trace(
                 f"{self.uid}: Remaining memory {self.remaining_mem_size} bytes"
             )
             return ErrCode.ESUCC
@@ -117,33 +119,32 @@ class MockDevice:
     def read(
         self,
         addr: int,
-    ) -> tuple[bytes, ErrCode]:
-        logger.debug(f"{self.uid}: Reading from {addr=}")
+    ) -> tuple[Any, ErrCode]:
+        logger.trace(f"{self.uid}: Reading from {addr=}")
         try:
             mb = self.mem_blocks[addr]
         except KeyError:
             logger.error(f"{self.uid}: Memory {addr=} not found")
-            return b"", ErrCode.ENODATA
+            return None, ErrCode.ENODATA
 
-        if mb.raw is None:
-            logger.error(f"{self.uid}: Memory {addr=} is not initialized")
-            return b"", ErrCode.ENODATA
+        if mb.value is None:
+            logger.warning(f"{self.uid}: Memory {addr=} is not initialized")
 
-        return mb.raw, ErrCode.ESUCC
+        return mb.value, ErrCode.ESUCC
 
     def write(
         self,
         addr: int,
-        raw: bytes,
+        value: Any,
     ) -> ErrCode:
-        logger.debug(f"{self.uid}: Writing bytes to {addr=}")
+        logger.trace(f"{self.uid}: Writing to {addr=}")
         try:
             mb = self.mem_blocks[addr]
         except KeyError:
             logger.error(f"{self.uid}: Memory {addr=} not found")
             return ErrCode.ENODATA
 
-        mb.raw = raw
+        mb.value = value
         return ErrCode.ESUCC
 
 

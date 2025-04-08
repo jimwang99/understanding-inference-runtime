@@ -1,19 +1,23 @@
+import numpy as np
 import unittest
 
 from loguru import logger
 
 from server.error_code import ErrCode
 from server.mock_hardware import MockDevice
-from server.mock_firmware import Pointers, MockFirmware, Executable
+from server.mock_firmware import MockFirmware
+from server.kernel import Kernel
 
-class MockBootProgramSimple(Executable):
+class MockBootProgramSimple(Kernel):
     def __init__(self) -> None:
         super().__init__("MockBootProgramSimple")
 
     def _execute(self) -> ErrCode:
-        logger.debug("MockBootProgramSimple start")
+        t0_addr, t0 = self.create_tensor("test_tensor_0", np.array([[1, 2, 3], [4, 5, 6]]))
+        e0_addr, e0 = self.create_event("test_event_0")
+        p0_addr, p0 = self.create_pointers("test_pointers_0", [str(t0_addr), str(e0_addr)])
+
         self.quit()
-        logger.debug("MockBootProgramSimple finish")
         return ErrCode.ESUCC
 
 
